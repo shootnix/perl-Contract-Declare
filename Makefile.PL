@@ -15,5 +15,5 @@ WriteMakefile(
     TEST_REQUIRES => {
         'Test::More' => '0',
     },
-    MIN_PERL_VERSION => '5.10.0',
+    MIN_PERL_VERSION => '5.14.0',
 );

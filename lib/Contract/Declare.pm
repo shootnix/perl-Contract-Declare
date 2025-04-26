@@ -1,6 +1,6 @@
 package Contract::Declare;
 
-use v5.10;
+use v5.14;
 use Exporter 'import';
 use Role::Tiny ();
 use Scalar::Util qw(blessed);
