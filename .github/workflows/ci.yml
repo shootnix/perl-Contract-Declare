@@ -13,7 +13,7 @@ jobs:
 
     strategy:
       matrix:
-        perl-version: [ '5.14', '5.36' ] 
+        perl-version: [ '5.14', '5.36', '5.38', '5.40' ] 
 
     steps:
       - name: Checkout repository
