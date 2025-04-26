@@ -1,15 +1,19 @@
 package Contract::Declare;
 
-use v5.32;
+use v5.10;
 use Exporter 'import';
 use Role::Tiny ();
 use Scalar::Util qw(blessed);
 use Carp;
 
+
 our @EXPORT = qw(contract interface method returns);
 
 our $CURRENT_PKG;
 my %REGISTRY;
+
+our $VERSION = '1.0.0';
+
 
 sub contract {
     local $CURRENT_PKG;
