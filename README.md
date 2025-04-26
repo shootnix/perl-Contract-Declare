@@ -1,10 +1,10 @@
 # Contract::Declare
 
-[![CI](https://github.com/shootnix/perl-Contract-Declare/actions/workflows/ci.yml/badge.svg)](https://github.com/yourname/Contract-Declare/actions)
+[![CI](https://github.com/shootnix/perl-Contract-Declare/actions/workflows/ci.yml/badge.svg)](https://github.com/shootnix/perl-Contract-Declare/actions)
 [![CPAN Version](https://badge.fury.io/pl/perl-Contract-Declare.svg)](https://metacpan.org/pod/Contract::Declare)
 [![License](https://img.shields.io/badge/license-Perl%20Artistic-blue.svg)](https://dev.perl.org/licenses/artistic.html)
-[![Issues](https://img.shields.io/github/issues/shootnix/perl-Contract-Declare.svg)](https://github.com/yourname/Contract-Declare/issues)
-[![Stars](https://img.shields.io/github/stars/shootnix/perl-Contract-Declare.svg)](https://github.com/yourname/Contract-Declare/stargazers)
+[![Issues](https://img.shields.io/github/issues/shootnix/perl-Contract-Declare.svg)](https://github.com/shootnix/perl-Contract-Declare/issues)
+[![Stars](https://img.shields.io/github/stars/shootnix/perl-Contract-Declare.svg)](https://github.com/shootnix/perl-Contract-Declare/stargazers)
 
 ---
 
