@@ -12,7 +12,7 @@ our @EXPORT = qw(contract interface method returns);
 our $CURRENT_PKG;
 my %REGISTRY;
 
-our $VERSION = '1.0.0';
+our $VERSION = '2.0.0';
 
 
 sub contract {
