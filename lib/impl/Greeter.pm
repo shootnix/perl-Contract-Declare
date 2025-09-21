@@ -7,6 +7,8 @@ sub sayHello {
     my ($this, $name) = @_;
 
     say "Hello, $name";
+
+    return ();
 }
 
 1;
