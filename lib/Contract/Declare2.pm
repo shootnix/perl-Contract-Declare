@@ -1,27 +1,29 @@
-# lib/Contract/Declare2.pm
 package Contract::Declare2;
 
 use strict;
 use warnings;
 
 use Types::Standard   ();
-BEGIN { eval { require Type::Tiny::XS; 1 } }  # ускоряет compiled_check, если установлен
+BEGIN { eval { require Type::Tiny::XS; 1 } }  # speeds up compiled_check if installed
 
 use Attribute::Handlers;
-use Class::MOP       ();
 use Scalar::Util     qw(blessed);
 use Sub::Util        qw(set_subname);
-use Type::Registry   ();
 
-# ====== реестры ======
-my  %SEEN;                        # временно: iface_pkg -> { method => { args=>[], returns=>[] } }
-our %IFACE;                       # итог: iface_pkg -> method -> { in_checks=>[CODE..], out_checks=>[CODE..], check_returns=>bool }
-my  %TYPE_CACHE;                  # ключ: "$ctx|$expr" (строка типа/выражение) -> предикат CODE
+# ====== registries / state ======
+my  %SEEN;                        # temp: iface_pkg -> { method => { args=>[], returns=>[] } }
+our %IFACE;                       # final: iface_pkg -> method -> { in_checks=>[CODE..], out_checks=>[CODE..], check_returns=>bool }
+my  %TYPE_CACHE;                  # key: "$ctx|$expr" -> predicate CODE
 my  %IMPLEMENTS;                  # class_pkg -> [ iface_pkgs ... ]
-my  %DECORATE_IN_PLACE;           # class_pkg -> bool
-my  %INTERFACE_MARK;              # pkg -> 1   (только помеченные пакеты считаются интерфейсами)
+my  %INTERFACE_MARK;              # pkg -> 1 (which packages are treated as interfaces)
 
-# ====== ХЕЛПЕРЫ (должны быть выше INIT) ======
+# accelerators
+my  %ADAPTER_CACHE;               # {$iface}{$impl_pkg|$is_obj} = adapter_pkg
+my  $ADAPTER_SEQ = 0;             # unique names for adapter packages
+my  %IFACE_METHOD_LIST;           # {$iface} = [ method1, method2, ... ]
+my  %VTABLE_CACHE;                # {$iface}{$impl_pkg} = { method => CODE, ... }
+
+# ====== helpers ======
 sub _norm_list {
     my ($x) = @_;
     return [] unless defined $x;
@@ -29,18 +31,18 @@ sub _norm_list {
     return [$x];
 }
 
-# различаем: undef — "не проверяем", [] — "строго void", [..] — список типов
+# distinguish: undef — "do not validate", [] — "strict void", [..] — list of types/predicates
 sub _norm_returns {
     my ($x) = @_;
-    return undef                                unless defined $x;            # не задано → не проверяем return
+    return undef                                unless defined $x;            # not specified → do not validate return
     return []             if ref($x) eq 'ARRAY' && @$x == 0;                  # :Returns() → void
-    return $x             if ref($x) eq 'ARRAY';                              # список типов
-    return [$x];                                                                # одиночный тип
+    return $x             if ref($x) eq 'ARRAY';
+    return [$x];
 }
 
-# ====== финализация после компиляции всех юнитов ======
+# ====== finalization ======
 INIT {
-    # 1) собрать интерфейсы из атрибутов только для помеченных пакетов
+    # 1) build interfaces from attributes only for marked packages
     while (my ($pkg, $spec) = each %SEEN) {
         next unless $INTERFACE_MARK{$pkg};
         for my $m (keys %$spec) {
@@ -51,20 +53,18 @@ INIT {
     }
     %SEEN = ();
 
-    # 2) применить implements-связи
+    # 2) apply implements-relations (strict method presence check)
     while (my ($class, $ifaces) = each %IMPLEMENTS) {
         for my $iface (@$ifaces) {
             _ensure_interface_exists($iface);
             _apply_implements($class, $iface);
-            _decorate_in_place($class, $iface) if $DECORATE_IN_PLACE{$class};
         }
     }
 }
 
-# ====== import: разделяем роли по ключам ======
-#   ':interface'                      — интерфейсный пакет (собираем атрибуты)
-#   ':impl', implements => 'Iface'    — класс-имплементация (проверка/линк)
-#          decorate_in_place => 1     — оборачивать методы класса валидаторами
+# ====== import: tags ======
+#   ':interface'                      — interface package (collect attributes)
+#   ':impl', implements => 'Iface'    — implementation class (check/link)
 sub import {
     my ($class, @args) = @_;
     my $caller = caller;
@@ -82,35 +82,30 @@ sub import {
         my $impl = delete $opts{implements};
         my @ifaces = ref($impl) eq 'ARRAY' ? @$impl : ($impl);
         push @{ $IMPLEMENTS{$caller} }, grep { defined && length } @ifaces;
-
-        if (delete $opts{decorate_in_place}) {
-            $DECORATE_IN_PLACE{$caller} = 1;
-        }
     }
 }
 
-# ====== атрибуты на методах интерфейса ======
+# ====== attributes (no RAWDATA, no composite types) ======
 sub UNIVERSAL::Args :ATTR(CODE) {
     my ($pkg, $sym, undef, undef, $data) = @_;
-    return unless $INTERFACE_MARK{$pkg};  # учитываем только помеченные пакеты
+    return unless $INTERFACE_MARK{$pkg};
     my $name = *{$sym}{NAME};
-    $SEEN{$pkg}{$name}{args} = $data;     # нормализуем в INIT
+    $SEEN{$pkg}{$name}{args} = $data;     # scalar | arrayref | undef — normalized in INIT
 }
 
 sub UNIVERSAL::Returns :ATTR(CODE) {
     my ($pkg, $sym, undef, undef, $data) = @_;
     return unless $INTERFACE_MARK{$pkg};
     my $name = *{$sym}{NAME};
-    $SEEN{$pkg}{$name}{returns} = $data;  # нормализуем в INIT
+    $SEEN{$pkg}{$name}{returns} = $data;  # scalar | arrayref | undef — normalized in INIT
 }
 
-# ====== объявление интерфейса: компиляция чеков, установка обёрток и new() ======
+# ====== interface declaration ======
 sub interface {
     my ($class, $iface, $contract) = @_;
     die "interface: need package name" unless defined $iface && length $iface;
     die "interface: need hashref spec" unless ref($contract) eq 'HASH';
 
-    my $meta  = Class::MOP::Class->initialize($iface);
     my $store = ($IFACE{$iface} //= {});
 
     for my $method (sort keys %$contract) {
@@ -124,9 +119,9 @@ sub interface {
         if (defined $rets) {
             my @ocs = map { _compile_check($_, $iface) } @$rets;  # [] → void
             $out_checks    = \@ocs;
-            $check_returns = 1;                                   # проверять арность/типы
+            $check_returns = 1;                                   # validate arity/types
         } else {
-            $out_checks    = undef;                               # вообще не проверять return
+            $out_checks    = undef;                               # do not validate return at all
             $check_returns = 0;
         }
 
@@ -135,205 +130,237 @@ sub interface {
             out_checks    => $out_checks,     # undef | []
             check_returns => $check_returns,  # bool
         };
-
-        _install_wrapper($meta, $iface, $method, $store->{$method});
     }
 
-    _install_constructor($meta, $iface);
+    # cache sorted interface method list
+    $IFACE_METHOD_LIST{$iface} = [ sort keys %{ $IFACE{$iface} } ];
+
+    _install_constructor_fast($iface);   # fast constructor/adapter
     return $iface;
 }
 
-# ====== компиляция типа/выражения → быстрый предикат ======
+# ====== compile type/expression → fast predicate ======
+# Supports:
+#  - Type::Tiny object (e.g., Types::Standard::Str())
+#  - CODE predicate
+#  - GLOB with CODE
+#  - Simple type name from Types::Standard ('Str','Int',...)
+#  - Function name predicate (in $ctx_pkg:: or main::)
 sub _compile_check {
-    my ($t, $ctx_pkg) = @_;   # $ctx_pkg — пакет интерфейса (для Registry и поиска предикатов)
+    my ($t, $ctx_pkg) = @_;
 
-    # 1) Type::Tiny объект
+    # Type::Tiny object
     if (eval { $t->isa('Type::Tiny') }) {
-        my $pred = $t->compiled_check;        # ускорится через Type::Tiny::XS
-        return sub { $pred->($_[0]) ? 1 : 0 };
+        return $t->compiled_check;        # no extra wrapper
     }
 
-    # 2) CODE — пользовательский предикат
+    # CODE — user predicate
     if (ref($t) eq 'CODE') {
-        return sub { $t->($_[0]) ? 1 : 0 };
+        return $t;
     }
 
-    # 3) GLOB — вдруг передали *func; достанем CODE
+    # GLOB — *func
     if (ref($t) eq 'GLOB') {
         my $cr = *{$t}{CODE} or die "Glob does not reference a CODE";
-        return sub { $cr->($_[0]) ? 1 : 0 };
+        return $cr;
     }
 
-    # 4) Строка: может быть (а) имя функции-предиката, (б) выражение типа (Maybe[Int]), (в) простое имя типа
+    # String
     if (!ref $t) {
         my $key = ($ctx_pkg // '') . '|' . $t;
-        if (exists $TYPE_CACHE{$key}) {
-            return $TYPE_CACHE{$key};
-        }
+        if (exists $TYPE_CACHE{$key}) { return $TYPE_CACHE{$key} }
 
-        # 4a) Попробуем трактовать как имя функции-предиката
+        # first try as function name predicate
         {
-            my $fq;
-            if ($t =~ /::/) {                    # явно квалифицировано
-                $fq = $t;
-            } else {
-                # сначала искать в пакете интерфейса, затем в main::
-                $fq = $ctx_pkg ? "${ctx_pkg}::$t" : $t;
-            }
-
+            (my $name = $t) =~ s/^\s+|\s+$//g;
             no strict 'refs';
-            if (my $cr = *{"${fq}"}{CODE}) {
-                return $TYPE_CACHE{$key} = sub { $cr->($_[0]) ? 1 : 0 };
+            my $fq = ($name =~ /::/) ? $name : ($ctx_pkg ? "${ctx_pkg}::$name" : $name);
+            if (my $cr = *{"$fq"}{CODE}) {
+                return $TYPE_CACHE{$key} = $cr;
             }
-            if (my $cr2 = *{"main::$t"}{CODE}) {
-                return $TYPE_CACHE{$key} = sub { $cr2->($_[0]) ? 1 : 0 };
-            }
-        }
-
-        # 4b) Параметризованные и составные типы: через Type::Registry
-        {
-            my $reg = Type::Registry->for_class( $ctx_pkg // 'main' );
-            $reg->add_types('Types::Standard');              # гарантируем базовые типы
-
-            if (my $tt = $reg->lookup($t)) {                 # понимает Maybe[Int], ArrayRef[Int], Tuple[Int,Str], ...
-                my $pred = $tt->compiled_check;
-                return $TYPE_CACHE{$key} = sub { $pred->($_[0]) ? 1 : 0 };
+            if (my $cr2 = *{"main::$name"}{CODE}) {
+                return $TYPE_CACHE{$key} = $cr2;
             }
         }
 
-        # 4c) Фоллбек: простые имена из Types::Standard
+        # Simple type from Types::Standard
         if (my $ctor = Types::Standard->can($t)) {
-            my $tt   = $ctor->();
-            my $pred = $tt->compiled_check;
-            return $TYPE_CACHE{$key} = sub { $pred->($_[0]) ? 1 : 0 };
+            my $tt = $ctor->();
+            return $TYPE_CACHE{$key} = $tt->compiled_check;
         }
 
         die "Unknown type or predicate '$t'";
     }
 
-    die "Unsupported type spec '$t' (want Type::Tiny, type name/expression, or CODE)";
+    die "Unsupported type spec '$t' (want Type::Tiny, type name, or CODE)";
 }
 
-# ====== конструктор new($impl) — кэшируем методы реализации ======
-sub _install_constructor {
-    my ($meta, $iface) = @_;
-    return if $meta->has_method('new');
+# ====== fast constructor/adapter (no MOP/hash/branches) ======
+sub _install_constructor_fast {
+    my ($iface) = @_;
 
-    my $ctor = sub {
+    no strict 'refs';
+    return if defined &{"${iface}::new"};
+
+    *{"${iface}::new"} = sub {
         my ($class, $impl) = @_;
         die "$class->new: impl (object or class) required" unless defined $impl;
 
         my $is_obj   = blessed($impl) ? 1 : 0;
         my $impl_pkg = $is_obj ? ref($impl) : $impl;
 
-        my %call;
-        for my $m (keys %{ $IFACE{$class} || {} }) {
-            my $code = _resolve_impl_method($impl_pkg, $m)
-              or die "$class->new: $impl_pkg does not implement $m()";
-            $call{$m} = $code;
-        }
+        # adapter package cache keyed by (iface, impl_pkg, is_obj)
+        my $cache_key = "$impl_pkg|$is_obj";
+        my $adp_pkg   = $ADAPTER_CACHE{$class}{$cache_key};
 
-        return bless {
-            _impl     => $impl,
-            _impl_pkg => $impl_pkg,
-            _is_obj   => $is_obj,
-            _call     => \%call,
-        }, $class;
-    };
+        unless ($adp_pkg) {
+            # 1) get/build vtable for (iface, impl_pkg)
+            my $v = ($VTABLE_CACHE{$class}{$impl_pkg} //= do {
+                my %tmp;
+                for my $m (@{ $IFACE_METHOD_LIST{$class} }) {
+                    my $code = *{"${impl_pkg}::$m"}{CODE}
+                      or die "$class->new: $impl_pkg does not implement $m()";
+                    $tmp{$m} = $code;
+                }
+                \%tmp
+            });
 
-    set_subname("${iface}::new", $ctor);
-    $meta->add_method(new => $ctor);
-}
+            # 2) create adapter package and install methods
+            my $san = $impl_pkg; $san =~ s/::/__/g;
+            $adp_pkg = "${class}::__Adapter__::$san\__$is_obj\__" . ($ADAPTER_SEQ++);
 
-sub _resolve_impl_method {
-    my ($pkg, $m) = @_;
-    no strict 'refs';
-    return *{"${pkg}::$m"}{CODE};
-}
-
-# ====== адаптер-метод в интерфейсном классе ======
-sub _install_wrapper {
-    my ($meta, $iface_pkg, $method, $checks) = @_;
-
-    my $wrapper = sub {
-        my $self = shift;
-
-        _validate_args_fast(\@_, 0, $checks->{in_checks}, "$iface_pkg->$method");
-
-        my $code = $self->{_call}{$method};
-        my @out;
-        if (wantarray) {
-            @out = $self->{_is_obj} ? $code->($self->{_impl},      @_)
-                                     : $code->($self->{_impl_pkg},  @_);
-        } else {
-            $out[0] = $self->{_is_obj} ? $code->($self->{_impl},      @_)
-                                       : $code->($self->{_impl_pkg},  @_);
-        }
-
-        if ($checks->{check_returns}) {
-            my $ocs  = $checks->{out_checks};         # undef уже отфильтрован
-            my @vals = wantarray ? @out : @out ? ($out[0]) : ();
-            my $need = @$ocs;                         # 0 → строго void
-
-            die "$iface_pkg->$method return: expected $need values, got ".@vals
-                if @vals != $need;
-
-            for my $i (0..$#$ocs) {
-                _validate_one($ocs->[$i], $vals[$i], "$iface_pkg->$method return\[$i\]");
+            if ($is_obj) {
+                # object variant: $_[0] = $_[0][0];
+                for my $m (@{ $IFACE_METHOD_LIST{$class} }) {
+                    my $checks = $IFACE{$class}{$m};
+                    my $preds  = $checks->{in_checks};
+                    my $outs   = $checks->{check_returns} ? $checks->{out_checks} : undef;
+                    my $code   = $v->{$m};
+                    *{"${adp_pkg}::${m}"} = $outs
+                        ? _make_wrapped_obj_with_returns($class, $m, $preds, $outs, $code)
+                        : _make_wrapped_obj_fast      ($class, $m, $preds,         $code);
+                }
+            } else {
+                # class variant: $_[0] = $impl_pkg;
+                for my $m (@{ $IFACE_METHOD_LIST{$class} }) {
+                    my $checks = $IFACE{$class}{$m};
+                    my $preds  = $checks->{in_checks};
+                    my $outs   = $checks->{check_returns} ? $checks->{out_checks} : undef;
+                    my $code   = $v->{$m};
+                    *{"${adp_pkg}::${m}"} = $outs
+                        ? _make_wrapped_class_with_returns($class, $m, $preds, $outs, $code, $impl_pkg)
+                        : _make_wrapped_class_fast      ($class, $m, $preds,         $code, $impl_pkg);
+                }
             }
+
+            $ADAPTER_CACHE{$class}{$cache_key} = $adp_pkg;
         }
 
-        return wantarray ? @out : $out[0];
+        # 3) bless — object keeps impl only in object case
+        return $is_obj ? bless [ $impl ], $adp_pkg
+                       : bless [],        $adp_pkg;
     };
-
-    set_subname("${iface_pkg}::$method", $wrapper);
-    $meta->add_method($method => $wrapper);
 }
 
-# ====== быстрая валидация аргументов ======
-sub _validate_args_fast {
-    my ($aref, $offset, $preds, $label) = @_;
-    my $need = @$preds;
-    my $have = @$aref - $offset;
-    die "$label: expected $need args, got $have" if $have != $need;
+# ====== wrappers: object ======
+sub _make_wrapped_obj_fast {
+    my ($iface, $m, $preds, $code) = @_;
 
-    if ($need == 0) { return }
+    return sub {
+        my $argc = @_-1;
+        my $need = @$preds;
+        die "$iface->$m: expected $need args, got $argc" if $argc != $need;
 
-    if ($need == 1) {
-        my $v = $aref->[$offset];
-        return if $preds->[0]->($v);
-        _fail("$label: arg[0] failed", $v);
-    }
-    elsif ($need == 2) {
-        my $v0 = $aref->[$offset];
-        my $v1 = $aref->[$offset+1];
-        my $ok0 = $preds->[0]->($v0);
-        my $ok1 = $preds->[1]->($v1);
-        return if $ok0 && $ok1;
-        _fail("$label: arg[".($ok0?'':'0').($ok1?'':'1')."] failed", $ok0 ? $v1 : $v0);
-    }
-    else {
         for (my $i=0; $i<$need; $i++) {
-            my $v = $aref->[$offset+$i];
-            next if $preds->[$i]->($v);
-            _fail("$label: arg[$i] failed", $v);
+            $preds->[$i]->($_[$i+1]) or _fail("$iface->$m: arg[$i] failed", $_[$i+1]);
         }
-    }
+
+        $_[0] = $_[0][0];  # invocant = real implementation object
+        goto &$code;
+    };
 }
 
-sub _validate_one {
-    my ($pred, $v, $label) = @_;
-    return if $pred->($v);
-    _fail("$label failed", $v);
+sub _make_wrapped_obj_with_returns {
+    my ($iface, $m, $preds, $outs, $code) = @_;
+
+    return sub {
+        my $argc = @_-1;
+        my $need = @$preds;
+        die "$iface->$m: expected $need args, got $argc" if $argc != $need;
+
+        for (my $i=0; $i<$need; $i++) {
+            $preds->[$i]->($_[$i+1]) or _fail("$iface->$m: arg[$i] failed", $_[$i+1]);
+        }
+
+        $_[0] = $_[0][0];
+
+        if (wantarray) {
+            my @r = $code->(@_);
+            my $need_r = @$outs;
+            die "$iface->$m return: expected $need_r values, got ".@r if @r != $need_r;
+            for my $j (0..$#$outs) { $outs->[$j]->($r[$j]) or _fail("$iface->$m return\[$j\]", $r[$j]) }
+            return @r;
+        } else {
+            my $r = $code->(@_);
+            my $need_r = @$outs;
+            my $got    = defined wantarray ? 1 : 0;
+            die "$iface->$m return: expected $need_r values, got $got" if $got != $need_r;
+            $outs->[0]->($r) or _fail("$iface->$m return\[0]", $r) if $need_r;
+            return $r;
+        }
+    };
 }
 
-sub _fail {
-    my ($msg, $v) = @_;
-    no overloading;
-    die defined $v ? "$msg (got $v)" : "$msg";
+# ====== wrappers: class ======
+sub _make_wrapped_class_fast {
+    my ($iface, $m, $preds, $code, $impl_pkg) = @_;
+
+    return sub {
+        my $argc = @_-1;
+        my $need = @$preds;
+        die "$iface->$m: expected $need args, got $argc" if $argc != $need;
+
+        for (my $i=0; $i<$need; $i++) {
+            $preds->[$i]->($_[$i+1]) or _fail("$iface->$m: arg[$i] failed", $_[$i+1]);
+        }
+
+        $_[0] = $impl_pkg;  # invocant = implementation class name
+        goto &$code;
+    };
 }
 
-# ====== implements: проверки + Role::Tiny, опционально decorate_in_place ======
+sub _make_wrapped_class_with_returns {
+    my ($iface, $m, $preds, $outs, $code, $impl_pkg) = @_;
+
+    return sub {
+        my $argc = @_-1;
+        my $need = @$preds;
+        die "$iface->$m: expected $need args, got $argc" if $argc != $need;
+
+        for (my $i=0; $i<$need; $i++) {
+            $preds->[$i]->($_[$i+1]) or _fail("$iface->$m: arg[$i] failed", $_[$i+1]);
+        }
+
+        $_[0] = $impl_pkg;
+
+        if (wantarray) {
+            my @r = $code->(@_);
+            my $need_r = @$outs;
+            die "$iface->$m return: expected $need_r values, got ".@r if @r != $need_r;
+            for my $j (0..$#$outs) { $outs->[$j]->($r[$j]) or _fail("$iface->$m return\[$j\]", $r[$j]) }
+            return @r;
+        } else {
+            my $r = $code->(@_);
+            my $need_r = @$outs;
+            my $got    = defined wantarray ? 1 : 0;
+            die "$iface->$m return: expected $need_r values, got $got" if $got != $need_r;
+            $outs->[0]->($r) or _fail("$iface->$m return\[0]", $r) if $need_r;
+            return $r;
+        }
+    };
+}
+
+# ====== implements (strict method presence check) ======
 sub _ensure_interface_exists {
     my ($iface) = @_;
     die "Unknown interface $iface" unless exists $IFACE{$iface};
@@ -342,67 +369,28 @@ sub _ensure_interface_exists {
 sub _apply_implements {
     my ($class, $iface) = @_;
 
-    # 1) строгая проверка наличия методов
     my $spec = $IFACE{$iface} || {};
     for my $m (keys %$spec) {
-        my $code = _resolve_impl_method($class, $m);
-        die "$class must implement $m() for interface $iface"
-            unless $code;
+        no strict 'refs';
+        my $code = *{"${class}::$m"}{CODE};
+        die "$class must implement $m() for interface $iface" unless $code;
     }
 
-    # 2) Role::Tiny (если установлен): создаём роль iface::Role с requires и применяем
-    if (eval { require Role::Tiny; 1 }) {
-        my $role = "${iface}::Role";
-        unless (_role_already_created($role)) {
-            my @req = sort keys %$spec;
-            my $src = "package $role; use Role::Tiny; requires qw(" . join(' ', @req) . "); 1;";
-            eval $src or die "Failed to create role $role: $@";
-        }
-        Role::Tiny->apply_roles_to_package($class, $role);
-    }
+    # keep as no-op; Role::Tiny can be added separately if desired
 }
 
-sub _decorate_in_place {
-    my ($class, $iface) = @_;
-    my $spec = $IFACE{$iface} || {};
-    my $meta = Class::MOP::Class->initialize($class);
-
-    for my $m (keys %$spec) {
-        next unless $meta->has_method($m);
-        my $orig   = $meta->get_method($m)->body;
-        my $checks = $spec->{$m};
-
-        my $wrapped = sub {
-            _validate_args_fast(\@_, 0, $checks->{in_checks}, "$class->$m");
-            my @out = wantarray ? $orig->(@_) : scalar $orig->(@_);
-            if ($checks->{check_returns}) {
-                my $ocs  = $checks->{out_checks};
-                my @vals = wantarray ? @out : @out ? ($out[0]) : ();
-                my $need = @$ocs;
-                die "$class->$m return: expected $need values, got ".@vals
-                    if @vals != $need;
-                for my $i (0..$#$ocs) {
-                    _validate_one($ocs->[$i], $vals[$i], "$class->$m return\[$i\]");
-                }
-            }
-            return wantarray ? @out : $out[0];
-        };
-
-        set_subname("${class}::$m", $wrapped);
-        $meta->add_method($m => $wrapped);
-    }
+# ====== validation / errors ======
+sub _fail {
+    my ($msg, $v) = @_;
+    no overloading;
+    die defined $v ? "$msg (got $v)" : "$msg";
 }
 
-sub _role_already_created {
-    my ($role) = @_;
-    no strict 'refs';
-    return defined *{"${role}::"}{HASH};  # пакет уже существует
-}
-
-# ====== утилиты ======
+# ====== utilities ======
 sub interface_spec {
     my ($class, $name) = @_;
     return $name ? $IFACE{$name} : \%IFACE;
 }
 
 1;
+
