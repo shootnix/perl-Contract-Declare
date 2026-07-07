@@ -1,4 +1,4 @@
-use v5.32;
+use v5.14;
 use warnings;
 
 # A well-behaved implementor of TestIface::Calculator: correct method

@@ -1,4 +1,4 @@
-use v5.32;
+use v5.14;
 use warnings;
 use Test2::V0;
 use FindBin;
