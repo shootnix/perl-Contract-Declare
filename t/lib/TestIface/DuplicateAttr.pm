@@ -1,4 +1,4 @@
-use v5.32;
+use v5.14;
 use warnings;
 
 # Applies :Expects twice to the same sub, which should panic as soon as

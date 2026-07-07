@@ -1,4 +1,4 @@
-use v5.32;
+use v5.14;
 use warnings;
 
 # Declares an interface with no explicit `name`, to verify it defaults
