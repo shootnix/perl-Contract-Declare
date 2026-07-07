@@ -38,7 +38,7 @@ package Contract::Declare::Implements {
 
         for my $iface_name (@iface_names) {
             $registry->{$iface_name} or croak "panic: can't find interface `$iface_name`" . " (did you forget to `use` the module that declares it?)";
-            push $IMP->{$caller}->@*, $iface_name;
+            push @{ $IMP->{$caller} }, $iface_name;
         }
     }
 
@@ -48,8 +48,8 @@ package Contract::Declare::Implements {
         no warnings 'redefine';
         for my $pkg (keys %$IMP) {
             load $pkg;
-            for my $iface_name ($IMP->{$pkg}->@*) {
-                for my $sub_name (keys $registry->{$iface_name}->%*) {
+            for my $iface_name (@{ $IMP->{$pkg} }) {
+                for my $sub_name (keys %{ $registry->{$iface_name} }) {
                     my $sub = $pkg->can($sub_name) or croak "$pkg donesn't implement interface `$iface_name`: can't do the `$sub_name` sub";
                     *{"${pkg}::$sub_name"} = sub {
                         validate($pkg, $sub_name, \@_, $registry->{$iface_name}{$sub_name}{EXPECTS});
