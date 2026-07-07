@@ -8,6 +8,7 @@ WriteMakefile(
     LICENSE      => 'perl',
     PREREQ_PM    => {
         'Role::Tiny'     => '0',
+        'Capture::Tiny'  => '0',
         'Type::Registry' => '0',
         'Type::Parser'   => '0',
         'Exporter'       => '0',
