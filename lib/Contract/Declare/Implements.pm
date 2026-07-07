@@ -15,7 +15,7 @@ package Contract::Declare::Implements {
     $reg->add_types("Types::Standard");
 
 
-    my sub validate {
+    sub validate {
         my ($pkg, $sub_name, $args, $expects) = @_;
 
         scalar @$args == scalar @$expects or croak "panic: number of expecting parameters doesn't match for $pkg" . '::' . $sub_name . '()';
