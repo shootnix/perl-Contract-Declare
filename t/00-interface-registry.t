@@ -12,7 +12,7 @@ my $registry = Contract::Declare::Interface::get_registry();
 subtest 'named interface is registered under its explicit name' => sub {
     ok(exists $registry->{Calculator}, 'Calculator interface exists in the registry');
     is(
-        [ sort keys $registry->{Calculator}->%* ],
+        [ sort keys %{ $registry->{Calculator} } ],
         [qw/add greet/],
         'registry lists exactly the subs declared on the interface',
     );
