@@ -7,10 +7,12 @@ WriteMakefile(
     AUTHOR       => 'Alexander Ponomarev <shootnix@gmail.com>',
     LICENSE      => 'perl',
     PREREQ_PM    => {
-        'Role::Tiny'    => '0',
-        'Exporter'      => '0',
-        'Scalar::Util'  => '0',
-        'Carp'          => '0',
+        'Role::Tiny'     => '0',
+        'Type::Registry' => '0',
+        'Type::Parser'   => '0',
+        'Exporter'       => '0',
+        'Scalar::Util'   => '0',
+        'Carp'           => '0',
     },
     TEST_REQUIRES => {
         'Test::More' => '0',

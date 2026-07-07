@@ -8,19 +8,24 @@
 
 ---
 
-**Contract::Declare** is a simple and lightweight system for defining typed contracts (interfaces) in Perl.
-
-It provides a small DSL to specify method arguments and return types, with optional runtime validation.
+**Contract::Declare** is a small design-by-contract toolkit for Perl. It lets you declare an
+**interface** — a named set of method signatures — separately from any class that implements it,
+and enforces those signatures at runtime: every call to an implementing method has its arguments
+and its return value checked against the declared types before the caller ever sees the result.
 
 ---
 
 ## Features
 
-- Define strict typed interfaces (contracts) for your classes
-- Optional runtime checking of method arguments and return values
-- Minimalistic DSL: `contract`, `interface`, `method`, `returns`
-- Integrates with `Role::Tiny` for easy role-based design
-- No heavy dependencies, very fast
+- Declare interfaces as plain packages, with method signatures expressed via
+  `:Expects(...)` / `:Returns(...)` attributes
+- Every implementing method is wrapped with a runtime type check on the way in and out
+- Types are resolved through `Type::Parser` / `Type::Registry`, so any `Types::Standard`
+  type name works out of the box (`Str`, `Int`, `Num`, `Bool`, `Object`, `HashRef`,
+  `ArrayRef`, `Maybe[Str]`, `Any`, ...)
+- Missing methods are caught early, with a clear error naming the class, the interface,
+  and the missing sub
+- No inheritance imposed on implementing classes — just a `use` statement
 
 ---
 
@@ -43,47 +48,102 @@ make install
 
 ---
 
-## Quick Start
+## Synopsis
 
 ```perl
-package MyInterface;
+# 1. Declare an interface: a package name plus a set of subs whose
+#    parameter and return types are the contract.
+package My::Reader {
+    use Contract::Declare::Interface name => 'Reader';
 
-use Contract::Declare;
-use Standard::Types qw(Int Str);
+    sub read :Expects(Object, Str) :Returns(Str);
+}
 
-contract 'MyInterface' => interface {
-    method add_number => (Int), returns(Int);
-    method get_name   => returns(Str);
-};
+# 2. Implement it. Every sub required by the interface must exist;
+#    Contract::Declare wraps each one with a runtime type check.
+package My::JSONReader {
+    use My::Reader;
+    use Contract::Declare::Implements qw/Reader/;
 
-package MyImpl;
+    sub new { return bless {}, shift }
 
-sub new { bless {}, shift }
-sub add_number { my ($self, $x) = @_; return $x + 1 }
-sub get_name   { return "example" }
+    sub read {
+        my ($self, $filename) = @_;
+        ...
+        return $file_contents;
+    }
+}
 
-# Using the contract
-my $impl = MyImpl->new;
-my $obj  = MyInterface->new($impl);
-
-say $obj->add_number(41);  # prints 42
-say $obj->get_name;        # prints "example"
+# 3. Use it. Arguments and return values are validated on every call.
+my $reader = My::JSONReader->new;
+my $text   = $reader->read('data.json');   # ok
+$reader->read('data.json', 'oops');        # dies: wrong number of parameters
+$reader->read([]);                         # dies: types mismatch: Str
 ```
 
 ---
 
-## Environment Variables
+## How it works
 
-| Variable | Description |
-|:---------|:-------------|
-| `CONTRACT_DECLARE_CHECK_TYPES` | Enables runtime validation of method arguments and return values if set to true |
-| `CONTRACT_DECLARE_KEEP_CONTRACT` | Keeps contract definitions in memory after building if set |
+The distribution is split into two collaborating modules:
 
-Example:
+- **[Contract::Declare::Interface](lib/Contract/Declare/Interface.pm)** — declares an interface:
+  a name, and a set of subs annotated with `:Expects(...)` and `:Returns(...)` attributes
+  describing the types of their parameters (including the invocant) and their return value.
+- **[Contract::Declare::Implements](lib/Contract/Declare/Implements.pm)** — marks a class as
+  implementing one or more interfaces. Every sub required by those interfaces must already
+  exist in the class; Contract::Declare replaces each one with a wrapper that validates
+  arguments on the way in and the return value on the way out, using `Types::Standard`
+  type names.
 
-```bash
-export CONTRACT_DECLARE_CHECK_TYPES=1
+Interfaces are recorded in a process-wide registry keyed by interface name. When a class does
+
+```perl
+use Contract::Declare::Implements qw/SomeInterface/;
 ```
+
+it registers itself as an implementor of `SomeInterface`. At the end of compilation (Perl's
+`INIT` phase, i.e. once every `use` in the program has run), `Contract::Declare::Implements`
+walks every registered implementor and, for each sub required by its interface(s):
+
+1. confirms the class actually defines that sub (via `$class->can(...)`);
+2. replaces it with a wrapper that validates `@_` against `:Expects`, calls the original
+   implementation, validates the result against `:Returns`, and then returns it to the caller.
+
+---
+
+## Caveats
+
+- **Implementing classes must be compiled before `INIT` time.** Contract enforcement is wired
+  up in an `INIT` block, which only fires once, after the whole program has finished compiling.
+  A class loaded via a top-level `use` (directly or indirectly) gets wrapped correctly. A class
+  loaded later at runtime via `require` (lazy-loading, plugin systems, etc.) is silently **not**
+  wrapped: its methods run unmodified, with no argument or return-value checking at all, and no
+  warning is issued.
+- **`:Expects`/`:Returns` are global attributes.** `Contract::Declare::Interface` installs its
+  `:Expects` and `:Returns` attribute handlers into `UNIVERSAL`, which makes them visible to
+  every package in the process once the module has been loaded once, not just to packages that
+  declare an interface. Attaching either attribute to a sub in a package that never called
+  `use Contract::Declare::Interface name => ...` raises a "panic: can't find any interface
+  implemented in ..." error.
+- **Interface names are unique per process.** Two interfaces cannot share a name; the second
+  `use Contract::Declare::Interface name => 'Same'` dies immediately.
+- **Only `Types::Standard` type names are recognised.** `:Expects`/`:Returns` are checked
+  against a `Type::Registry` that only has `Types::Standard` loaded. Type libraries from your
+  own application are not available unless you extend the registry yourself.
+- **Contract violations always `croak`.** There is no soft-fail mode; wrap calls in
+  `eval`/`Try::Tiny` if you need to recover from a contract violation instead of dying.
+
+---
+
+## See also
+
+[Contract::Declare](lib/Contract/Declare.pm),
+[Contract::Declare::Interface](lib/Contract/Declare/Interface.pm),
+[Contract::Declare::Implements](lib/Contract/Declare/Implements.pm),
+[Type::Tiny](https://metacpan.org/pod/Type::Tiny),
+[Types::Standard](https://metacpan.org/pod/Types::Standard),
+[Attribute::Handlers](https://metacpan.org/pod/Attribute::Handlers)
 
 ---
 
@@ -91,13 +151,15 @@ export CONTRACT_DECLARE_CHECK_TYPES=1
 
 Bug reports and pull requests are welcome!
 
-Please submit issues and feature requests via [GitHub Issues](https://github.com/yourname/Contract-Declare/issues).
+Please submit issues and feature requests via
+[GitHub Issues](https://github.com/shootnix/perl-Contract-Declare/issues).
 
 ---
 
 ## License
 
-This library is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
+This library is free software; you can redistribute it and/or modify it under the same terms
+as Perl itself.
 
 See the [Artistic License 1.0](https://dev.perl.org/licenses/artistic.html) for details.
 
@@ -107,4 +169,4 @@ See the [Artistic License 1.0](https://dev.perl.org/licenses/artistic.html) for 
 
 **Alexander Ponomarev** (<shootnix@gmail.com>)
 
-Project: [GitHub Repository](https://github.com/yourname/Contract-Declare)
+Project: [GitHub Repository](https://github.com/shootnix/perl-Contract-Declare)
