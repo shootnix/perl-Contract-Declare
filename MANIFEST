@@ -1,4 +1,6 @@
 lib/Contract/Declare.pm
+lib/Contract/Declare/Implements.pm
+lib/Contract/Declare/Interface.pm
 Makefile.PL
 MANIFEST			This list of files
 README.md
